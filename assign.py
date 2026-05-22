@@ -1,11 +1,11 @@
 import sys
 import random
 import yaml
-
+import itertools
 
 def load_config(config_path="config.yaml"):
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     except FileNotFoundError:
         print(f"Error: {config_path} が見つかりません。")
@@ -14,37 +14,24 @@ def load_config(config_path="config.yaml"):
         print(f"Error: YAMLファイルの解析に失敗しました: {e}")
         sys.exit(1)
 
-
-def optimize_assignment(preferences, role_counts):
-    # 各メンバーの最終割り当て (None は未割り当て)
+# --- モード1: 第1希望最優先モード (Satisfaction First) ---
+def solve_satisfaction_first(preferences, role_counts):
     assignments = {member: None for member in preferences.keys()}
-    # 各役職の残り空き枠数
     remaining_roles = role_counts.copy()
+    
+    all_ranks = [r for prefs in preferences.values() if prefs for r in prefs.values()]
+    max_rank = max(all_ranks) if all_ranks else 1
 
-    # 全員が提出した希望順位の最大値を取得（例: 3位まであれば 3）
-    all_ranks = [
-        r for prefs in preferences.values() if prefs for r in prefs.values()
-    ]
-    if not all_ranks:
-        return assignments
-    max_rank = max(all_ranks)
-
-    # 【重要】第1希望、第2希望、第3希望... と「順位の階層」ごとに完全に区切って処理
     for rank in range(1, max_rank + 1):
-        
-        # この順位階層の中で、まだ未確定の人が希望している役職をリストアップ
         role_demands = {role: [] for role in role_counts.keys()}
         for member, prefs in preferences.items():
             if assignments[member] is not None:
-                continue  # すでに上の順位で確定している人はスキップ
-
-            # この順位に該当する役職を取得（同率順位に対応）
+                continue
             desired_roles = [role for role, r in prefs.items() if r == rank]
             for role in desired_roles:
                 if role in role_demands:
                     role_demands[role].append(member)
 
-        # 希望者がいる役職に絞り、倍率（希望者数 ÷ 残り枠数）が高い順にソート
         active_roles = [r for r, count in remaining_roles.items() if count > 0 and len(role_demands[r]) > 0]
         sorted_roles = sorted(
             active_roles,
@@ -52,63 +39,121 @@ def optimize_assignment(preferences, role_counts):
             reverse=True
         )
 
-        # 倍率の高い役職から順番に、この順位での割り当てを確定させていく
         for role in sorted_roles:
             candidates = role_demands[role]
-            # 別の役職でこの順位（同率）がすでに確定した人を弾く
             valid_candidates = [c for c in candidates if assignments[c] is None]
-            
             if not valid_candidates:
                 continue
-
-            # 同一条件内の不公平をなくすためランダムシャッフル
+            
             random.shuffle(valid_candidates)
-
-            # 空き枠の分だけ当選させる
             available_slots = remaining_roles[role]
             chosen_members = valid_candidates[:available_slots]
 
             for member in chosen_members:
-                assignments[member] = f"{role} ({rank}希望)"
+                assignments[member] = (role, rank, False)
                 remaining_roles[role] -= 1
 
-    # 希望外分配（どこにも引っかからなかった人の救済）
+    # 希望外分配
+    _assign_unfilled(assignments, remaining_roles)
+    return assignments
+
+# --- モード2: ワースト回避モード (Fairness First) ---
+def solve_fairness_first(preferences, role_counts):
+    members = list(preferences.keys())
+    
+    # 各役職の枠をフラットなリストに展開 (例: {'HO1': 2} -> ['HO1', 'HO1'])
+    flat_roles = []
+    for role, count in role_counts.items():
+        flat_roles.extend([role] * count)
+        
+    if len(members) != len(flat_roles):
+        # 人数と定員が合わない場合は、標準モードにフォールバックして処理
+        print("【注意】人数と総定員が一致しないため、第1希望最優先モードで代用します。")
+        return solve_satisfaction_first(preferences, role_counts)
+
+    # 全員の一番悪い順位（ワースト度合い）が最も低くなる組み合わせを探す
+    best_patterns = []
+    min_max_penalty = float('inf')
+    min_total_penalty = float('inf')
+
+    # すべての配分パターンを走査（重複のない順列）
+    # ※数万人規模の巨大データでなければ一瞬で計算が終わります
+    seen_combinations = set()
+    for p in itertools.permutations(flat_roles):
+        # 役職の重複パターンをスキップして高速化
+        if p in seen_combinations:
+            continue
+        seen_combinations.add(p)
+        
+        current_max_penalty = 0
+        current_total_penalty = 0
+        current_pattern = {}
+
+        for member, role in zip(members, p):
+            # 希望順位を取得（未記入の場合は重いペナルティ）
+            rank = preferences[member].get(role, 99)
+            current_pattern[member] = (role, rank, rank == 99)
+            
+            # ペナルティの計算（下位ほど指数関数的に重くする）
+            penalty = rank ** 4 if rank != 99 else 10000
+            current_total_penalty += penalty
+            if penalty > current_max_penalty:
+                current_max_penalty = penalty
+
+        # 条件判定1: 誰か一人の最大不満度（ワースト）が過去のパターンより低いか
+        if current_max_penalty < min_max_penalty:
+            min_max_penalty = current_max_penalty
+            min_total_penalty = current_total_penalty
+            best_patterns = [current_pattern]
+        # 条件判定2: ワーストが同等なら、全員の不満度合計が最も低いか
+        elif current_max_penalty == min_max_penalty:
+            if current_total_penalty < min_total_penalty:
+                min_total_penalty = current_total_penalty
+                best_patterns = [current_pattern]
+            elif current_total_penalty == min_total_penalty:
+                best_patterns.append(current_pattern)
+
+    # 最適なパターンの中からランダムに1つを決定（不公平性の排除）
+    return random.choice(best_patterns)
+
+def _assign_unfilled(assignments, remaining_roles):
     unassigned_members = [m for m, r in assignments.items() if r is None]
     unfilled_roles = [r for r, count in remaining_roles.items() if count > 0]
-
     for member in unassigned_members:
         if unfilled_roles:
             spare_role = unfilled_roles[0]
-            assignments[member] = f"{spare_role} (希望外分配)"
+            assignments[member] = (spare_role, None, True)
             remaining_roles[spare_role] -= 1
             if remaining_roles[spare_role] == 0:
                 unfilled_roles.pop(0)
 
-    return assignments
-
-
 def main():
     config = load_config()
+    mode = config.get("mode", "satisfaction_first")
     roles = config.get("roles", {})
     preferences = config.get("preferences", {})
 
-    # バリデーション
     total_slots = sum(roles.values())
     total_people = len(preferences)
     if total_slots != total_people:
         print(f"【警告】総定員({total_slots}人)とメンバー数({total_people}人)が一致していません。\n")
 
-    # 割り当て実行
-    results = optimize_assignment(preferences, roles)
+    # モードに応じた関数を実行
+    if mode == "fairness_first":
+        results = solve_fairness_first(preferences, roles)
+    else:
+        results = solve_satisfaction_first(preferences, roles)
 
     # 結果の表示
-    print("=== 役職割り当て結果 ===")
+    print(f"=== 役職割り当て結果 ({'ワースト回避モード' if mode == 'fairness_first' else '第1希望最優先モード'}) ===")
     print(f"{'名前':<10} | {'割り当て役職':<15}")
     print("-" * 35)
-    for name, role in results.items():
-        print(f"{name:<10} | {role:<15}")
-
+    for name, (role, rank, is_out_of_bounds) in results.items():
+        if is_out_of_bounds:
+            display_role = f"{role} (希望外分配)"
+        else:
+            display_role = f"{role} ({rank}希望)"
+        print(f"{name:<10} | {display_role:<15}")
 
 if __name__ == "__main__":
     main()
-
