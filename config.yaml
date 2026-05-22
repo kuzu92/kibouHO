@@ -1,0 +1,29 @@
+# 1. 各役職の定員（合計人数が参加者数と一致するようにしてください）
+roles:
+  HO1: 1
+  HO2: 1
+  HO3: 1
+  HO4: 1
+
+# 2. メンバーの希望順位（数値が同じものは同率順位として扱われます）
+preferences:
+  Member1:
+    HO1: 2
+    HO2: 2
+    HO3: 1
+    HO4: 1
+  Member2:
+    HO1: 1
+    HO2: 3
+    HO3: 3
+    HO4: 2
+  Member3:
+    HO1: 2
+    HO2: 1
+    HO3: 3
+    HO4: 1
+  Member4:
+    HO1: 2
+    HO2: 1
+    HO3: 1
+    HO4: 3
